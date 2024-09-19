@@ -1,0 +1,28 @@
+[tool.poetry]
+name = "spin"
+version = "0.1.0"
+description = ""
+authors = ["Your Name <you@example.com>"]
+
+[tool.poetry.dependencies]
+python = "^3.8"
+torchvision = "0.13.1"
+tqdm = "^4.64.1"
+trimesh = "^3.20.0"
+smplx = "^0.1.28"
+tensorboard = "^2.12.0"
+pyrender = "^0.1.45"
+opencv-python = "^4.7.0.68"
+numpy = "1.23"
+setuptools = "59.5.0"
+torchgeometry = "^0.1.2"
+scikit-image = "^0.19.3"
+ffcv = "^0.0.3"
+numba = "^0.56.4"
+torch = "1.12.1"
+pandas = "1.1.5"
+lightning = "2.1"
+
+[build-system]
+requires = ["poetry-core>=1.0.0"]
+build-backend = "poetry.core.masonry.api"

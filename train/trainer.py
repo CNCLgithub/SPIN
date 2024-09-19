@@ -1,11 +1,14 @@
+import os.path as osp
+from glob import glob
+import json
+import pandas as pd
 import torch
 import torch.nn as nn
 import numpy as np
 from torchgeometry import angle_axis_to_rotation_matrix, rotation_matrix_to_angle_axis
-import cv2
 
-from datasets import MixedDataset
-from models import hmr, SMPL
+from datasets import MixedDataset, BaseDataset
+from models import SMPL, HMR
 from smplify import SMPLify
 from utils.geometry import batch_rodrigues, perspective_projection, estimate_translation
 from utils.renderer import Renderer
@@ -16,18 +19,59 @@ import constants
 from .fits_dict import FitsDict
 
 
-class Trainer(BaseTrainer):
-    
-    def init_fn(self):
-        self.train_ds = MixedDataset(self.options, ignore_3d=self.options.ignore_3d, is_train=True)
+def get_pretrained_info(log_dir, epoch=75):
+    """
+    Provides the model configuration and best checkpoint for a given name
+    """
+    config_pth = osp.join(log_dir, "config.json")
+    ckpts = osp.join(log_dir, "checkpoints", "*.pt")
+    with open(config_pth) as f:
+        mconfig = json.load(f)
+    pretrained_ckpt = sorted(glob(ckpts))[-1]
+    pretrained_epoch = torch.load(pretrained_ckpt)['epoch']
+    print(f"Latest ckpt is {pretrained_ckpt} at epoch {pretrained_epoch}")
+    if epoch is not None:
+        assert  pretrained_epoch == epoch
 
-        self.model = hmr(config.SMPL_MEAN_PARAMS, pretrained=True).to(self.device)
+    return mconfig, pretrained_ckpt
+
+class Trainer(BaseTrainer):
+
+    def init_fn(self):
+        pretrained_ckpt = self.options.pretrained_checkpoint
+        mkeys = ["backbone", "ief_iters", "rot6d", "n_fcs"]
+
+        if self.options.finetune_monkeys:
+            self.train_ds = BaseDataset(self.options, 'monkey', 6,
+                                        ignore_3d=self.options.ignore_3d,
+                                        is_train=True)
+            # we will use the last checkpoint of human training as the pretrained checkpoint
+            log_dir = self.options.log_dir.replace("-monkey", "")
+            log_dir_split = log_dir.split("_")
+            log_dir_split[2] = "5.0"
+            log_dir = "_".join(log_dir_split)
+            mconfig, pretrained_ckpt = get_pretrained_info(log_dir)
+            # parameterize the model architecture with the pretrained one
+            mkwargs = {key: mconfig[key] for key in mkeys}
+        else:
+            self.train_ds = MixedDataset(self.options,
+                                        ignore_3d=self.options.ignore_3d,
+                                        is_train=True)
+            # parameterize the model architecture from options
+            mkwargs = {key: getattr(self.options, key) for key in mkeys if hasattr(self.options, key)}
+
+        self.model = HMR(config.SMPL_MEAN_PARAMS, **mkwargs,
+                         pretrained=pretrained_ckpt is None)
+        self.model.to(self.device)
+
         self.optimizer = torch.optim.Adam(params=self.model.parameters(),
                                           lr=self.options.lr,
                                           weight_decay=0)
+
         self.smpl = SMPL(config.SMPL_MODEL_DIR,
                          batch_size=self.options.batch_size,
                          create_transl=False).to(self.device)
+
         # Per-vertex loss on the shape
         self.criterion_shape = nn.L1Loss().to(self.device)
         # Keypoint (2D and 3D) loss
@@ -40,15 +84,20 @@ class Trainer(BaseTrainer):
         self.focal_length = constants.FOCAL_LENGTH
 
         # Initialize SMPLify fitting module
-        self.smplify = SMPLify(step_size=1e-2, batch_size=self.options.batch_size, num_iters=self.options.num_smplify_iters, focal_length=self.focal_length)
-        if self.options.pretrained_checkpoint is not None:
-            self.load_pretrained(checkpoint_file=self.options.pretrained_checkpoint)
+        self.smplify = SMPLify(step_size=1e-2, batch_size=self.options.batch_size,
+                               num_iters=self.options.num_smplify_iters,
+                               focal_length=self.focal_length, device=self.device)
+        if pretrained_ckpt is not None:
+            print(f"Loading pretrained checkpoint file {pretrained_ckpt}..")
+            self.load_pretrained(checkpoint_file=pretrained_ckpt)
 
         # Load dictionary of fits
         self.fits_dict = FitsDict(self.options, self.train_ds)
 
         # Create renderer
-        self.renderer = Renderer(focal_length=self.focal_length, img_res=self.options.img_res, faces=self.smpl.faces)
+        self.renderer = Renderer(focal_length=self.focal_length,
+                                 img_res=self.options.img_res,
+                                 faces=self.smpl.faces)
 
     def finalize(self):
         self.fits_dict.save()
@@ -71,9 +120,9 @@ class Trainer(BaseTrainer):
         pred_keypoints_3d = pred_keypoints_3d[:, 25:, :]
         conf = gt_keypoints_3d[:, :, -1].unsqueeze(-1).clone()
         gt_keypoints_3d = gt_keypoints_3d[:, :, :-1].clone()
-        gt_keypoints_3d = gt_keypoints_3d[has_pose_3d == 1]
-        conf = conf[has_pose_3d == 1]
-        pred_keypoints_3d = pred_keypoints_3d[has_pose_3d == 1]
+        gt_keypoints_3d = gt_keypoints_3d[has_pose_3d]
+        conf = conf[has_pose_3d]
+        pred_keypoints_3d = pred_keypoints_3d[has_pose_3d]
         if len(gt_keypoints_3d) > 0:
             gt_pelvis = (gt_keypoints_3d[:, 2,:] + gt_keypoints_3d[:, 3,:]) / 2
             gt_keypoints_3d = gt_keypoints_3d - gt_pelvis[:, None, :]
@@ -108,18 +157,17 @@ class Trainer(BaseTrainer):
     def train_step(self, input_batch):
         self.model.train()
 
-        # Get data from the batch
         images = input_batch['img'] # input image
         gt_keypoints_2d = input_batch['keypoints'] # 2D keypoints
         gt_pose = input_batch['pose'] # SMPL pose parameters
         gt_betas = input_batch['betas'] # SMPL beta parameters
         gt_joints = input_batch['pose_3d'] # 3D pose
-        has_smpl = input_batch['has_smpl'].byte() # flag that indicates whether SMPL parameters are valid
-        has_pose_3d = input_batch['has_pose_3d'].byte() # flag that indicates whether 3D pose is valid
-        is_flipped = input_batch['is_flipped'] # flag that indicates whether image was flipped during data augmentation
-        rot_angle = input_batch['rot_angle'] # rotation angle used for data augmentation
-        dataset_name = input_batch['dataset_name'] # name of the dataset the image comes from
-        indices = input_batch['sample_index'] # index of example inside its dataset
+        has_smpl = input_batch['has_smpl'] # flag that indicates whether SMPL parameters are valid
+        has_pose_3d = input_batch['has_pose_3d'] # flag that indicates whether 3D pose is valid
+        is_flipped = input_batch['is_flipped'].cpu() # flag that indicates whether image was flipped during data augmentation
+        rot_angle = input_batch['rot_angle'].cpu() # rotation angle used for data augmentation
+        dataset_id = input_batch['dataset_id'].cpu().numpy() # name of the dataset the image comes from
+        indices = input_batch['sample_index'].cpu() # index of example inside its dataset
         batch_size = images.shape[0]
 
         # Get GT vertices and model joints
@@ -129,13 +177,12 @@ class Trainer(BaseTrainer):
         gt_vertices = gt_out.vertices
 
         # Get current best fits from the dictionary
-        opt_pose, opt_betas = self.fits_dict[(dataset_name, indices.cpu(), rot_angle.cpu(), is_flipped.cpu())]
+        opt_pose, opt_betas = self.fits_dict[(dataset_id, indices, rot_angle, is_flipped)]
         opt_pose = opt_pose.to(self.device)
         opt_betas = opt_betas.to(self.device)
         opt_output = self.smpl(betas=opt_betas, body_pose=opt_pose[:,3:], global_orient=opt_pose[:,:3])
         opt_vertices = opt_output.vertices
         opt_joints = opt_output.joints
-
 
         # De-normalize 2D keypoints from [-1,1] to pixel space
         gt_keypoints_2d_orig = gt_keypoints_2d.clone()
@@ -153,7 +200,7 @@ class Trainer(BaseTrainer):
                                                        gt_keypoints_2d_orig).mean(dim=-1)
 
         # Feed images in the network to predict camera and SMPL parameters
-        pred_rotmat, pred_betas, pred_camera = self.model(images)
+        _, pred_rotmat, pred_betas, pred_camera = self.model(images)
 
         pred_output = self.smpl(betas=pred_betas, body_pose=pred_rotmat[:,1:], global_orient=pred_rotmat[:,0].unsqueeze(1), pose2rot=False)
         pred_vertices = pred_output.vertices
@@ -196,7 +243,7 @@ class Trainer(BaseTrainer):
 
             # Will update the dictionary for the examples where the new loss is less than the current one
             update = (new_opt_joint_loss < opt_joint_loss)
-            
+
 
             opt_joint_loss[update] = new_opt_joint_loss[update]
             opt_vertices[update, :] = new_opt_vertices[update, :]
@@ -206,10 +253,11 @@ class Trainer(BaseTrainer):
             opt_cam_t[update, :] = new_opt_cam_t[update, :]
 
 
-            self.fits_dict[(dataset_name, indices.cpu(), rot_angle.cpu(), is_flipped.cpu(), update.cpu())] = (opt_pose.cpu(), opt_betas.cpu())
+            self.fits_dict[(dataset_id, indices, rot_angle, is_flipped, update.cpu())] = (opt_pose.cpu(), opt_betas.cpu())
 
         else:
-            update = torch.zeros(batch_size, device=self.device).byte()
+            update = torch.zeros(batch_size, device=self.device).bool()
+        # print(f"Updating {update.sum()} entries out of {len(update)}")
 
         # Replace extreme betas with zero betas
         opt_betas[(opt_betas.abs() > 3).any(dim=-1)] = 0.
@@ -238,6 +286,14 @@ class Trainer(BaseTrainer):
 
         # Compute loss on SMPL parameters
         loss_regr_pose, loss_regr_betas = self.smpl_losses(pred_rotmat, pred_betas, opt_pose, opt_betas, valid_fit)
+        # if torch.isnan(loss_regr_pose):
+        #     print("Dataset name", dataset_id)
+        #     print("pred_rotmat", pred_rotmat)
+        #     print("pred_betas", pred_betas)
+        #     print("opt_pose", opt_pose)
+        #     print("opt_betas", opt_betas)
+        #     print("valid_fit", valid_fit)
+        #     raise Exception("NaN detected.")
 
         # Compute 2D reprojection loss for the keypoints
         loss_keypoints = self.keypoint_loss(pred_keypoints_2d, gt_keypoints_2d,
@@ -253,10 +309,11 @@ class Trainer(BaseTrainer):
         # Compute total loss
         # The last component is a loss that forces the network to predict positive depth values
         loss = self.options.shape_loss_weight * loss_shape +\
-               self.options.keypoint_loss_weight * loss_keypoints +\
-               self.options.keypoint_loss_weight * loss_keypoints_3d +\
-               self.options.pose_loss_weight * loss_regr_pose + self.options.beta_loss_weight * loss_regr_betas +\
-               ((torch.exp(-pred_camera[:,0]*10)) ** 2 ).mean()
+               self.options.keypoint_2d_loss_weight * loss_keypoints +\
+               self.options.keypoint_3d_loss_weight * loss_keypoints_3d +\
+               self.options.pose_loss_weight * loss_regr_pose +\
+               self.options.beta_loss_weight * loss_regr_betas +\
+               float(self.options.keypoint_2d_loss_weight > 0) * ((torch.exp(-pred_camera[:,0]*10)) ** 2 ).mean()
         loss *= 60
 
 
@@ -279,18 +336,25 @@ class Trainer(BaseTrainer):
 
         return output, losses
 
-    def train_summaries(self, input_batch, output, losses):
+    def img_summary(self, input_batch, output, num_images=10):
         images = input_batch['img']
-        images = images * torch.tensor([0.229, 0.224, 0.225], device=images.device).reshape(1,3,1,1)
-        images = images + torch.tensor([0.485, 0.456, 0.406], device=images.device).reshape(1,3,1,1)
+        num_images = min(len(images), num_images)
+        images = images[:num_images]
+        with torch.no_grad():
+            images = images * torch.tensor(constants.IMG_NORM_STD, device=images.device).reshape(1,3,1,1)
+            images = images + torch.tensor(constants.IMG_NORM_MEAN, device=images.device).reshape(1,3,1,1)
 
-        pred_vertices = output['pred_vertices']
-        opt_vertices = output['opt_vertices']
-        pred_cam_t = output['pred_cam_t']
-        opt_cam_t = output['opt_cam_t']
-        images_pred = self.renderer.visualize_tb(pred_vertices, pred_cam_t, images)
-        images_opt = self.renderer.visualize_tb(opt_vertices, opt_cam_t, images)
+        pred_vertices = output['pred_vertices'][:num_images]
+        opt_vertices = output['opt_vertices'][:num_images]
+        pred_cam_t = output['pred_cam_t'][:num_images]
+        opt_cam_t = output['opt_cam_t'][:num_images]
+
+        with torch.no_grad():
+            images_pred = self.renderer.visualize_tb(pred_vertices, pred_cam_t, images)
+            images_opt = self.renderer.visualize_tb(opt_vertices, opt_cam_t, images)
         self.summary_writer.add_image('pred_shape', images_pred, self.step_count)
         self.summary_writer.add_image('opt_shape', images_opt, self.step_count)
+
+    def loss_summary(self, losses):
         for loss_name, val in losses.items():
             self.summary_writer.add_scalar(loss_name, val, self.step_count)

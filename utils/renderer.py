@@ -1,5 +1,5 @@
 import os
-os.environ['PYOPENGL_PLATFORM'] = 'osmesa'
+os.environ['PYOPENGL_PLATFORM'] = 'egl'
 import torch
 from torchvision.utils import make_grid
 import numpy as np
@@ -41,6 +41,7 @@ class Renderer:
         camera_translation[0] *= -1.
 
         mesh = trimesh.Trimesh(vertices, self.faces)
+        self.mesh = mesh
         rot = trimesh.transformations.rotation_matrix(
             np.radians(180), [1, 0, 0])
         mesh.apply_transform(rot)
@@ -74,3 +75,6 @@ class Renderer:
         output_img = (color[:, :, :3] * valid_mask +
                   (1 - valid_mask) * image)
         return output_img
+
+    def get_mesh(self):
+        return self.mesh

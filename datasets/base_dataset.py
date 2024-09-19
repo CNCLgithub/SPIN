@@ -18,25 +18,30 @@ class BaseDataset(Dataset):
     You need to update the path to each dataset in utils/config.py.
     """
 
-    def __init__(self, options, dataset, ignore_3d=False, use_augmentation=True, is_train=True):
+    def __init__(self, options, dataset, dataset_id, ignore_3d=False,
+                 use_augmentation=True, is_train=True, is_spin=True, split_train=True):
         super(BaseDataset, self).__init__()
         self.dataset = dataset
+        self.dataset_id = dataset_id
+        self.ds_dict = {"monkey":6}
         self.is_train = is_train
+        self.split_train = split_train
+        self.is_spin = is_spin
         self.options = options
         self.img_dir = config.DATASET_FOLDERS[dataset]
         self.normalize_img = Normalize(mean=constants.IMG_NORM_MEAN, std=constants.IMG_NORM_STD)
         self.data = np.load(config.DATASET_FILES[is_train][dataset])
         self.imgname = self.data['imgname']
         
-        # Get paths to gt masks, if available
-        try:
-            self.maskname = self.data['maskname']
-        except KeyError:
-            pass
-        try:
-            self.partname = self.data['partname']
-        except KeyError:
-            pass
+        # # Get paths to gt masks, if available
+        # try:
+        #     self.maskname = self.data['maskname']
+        # except KeyError:
+        #     pass
+        # try:
+        #     self.partname = self.data['partname']
+        # except KeyError:
+        #     pass
 
         # Bounding boxes are assumed to be in the center and scale format
         self.scale = self.data['scale']
@@ -45,46 +50,66 @@ class BaseDataset(Dataset):
         # If False, do not do augmentation
         self.use_augmentation = use_augmentation
         
-        # Get gt SMPL parameters, if available
-        try:
-            self.pose = self.data['pose'].astype(np.float)
-            self.betas = self.data['shape'].astype(np.float)
-            if 'has_smpl' in self.data:
-                self.has_smpl = self.data['has_smpl']
-            else:
-                self.has_smpl = np.ones(len(self.imgname))
-        except KeyError:
-            self.has_smpl = np.zeros(len(self.imgname))
-        if ignore_3d:
-            self.has_smpl = np.zeros(len(self.imgname))
-        
-        # Get gt 3D pose, if available
-        try:
-            self.pose_3d = self.data['S']
-            self.has_pose_3d = 1
-        except KeyError:
-            self.has_pose_3d = 0
-        if ignore_3d:
-            self.has_pose_3d = 0
-        
-        # Get 2D keypoints
-        try:
-            keypoints_gt = self.data['part']
-        except KeyError:
-            keypoints_gt = np.zeros((len(self.imgname), 24, 3))
-        try:
-            keypoints_openpose = self.data['openpose']
-        except KeyError:
-            keypoints_openpose = np.zeros((len(self.imgname), 25, 3))
-        self.keypoints = np.concatenate([keypoints_openpose, keypoints_gt], axis=1)
+        if self.is_spin:
+            # Get gt SMPL parameters, if available
+            try:
+                self.pose = self.data['pose'].astype(float)
+                self.betas = self.data['shape'].astype(float)
+                if 'has_smpl' in self.data:
+                    self.has_smpl = self.data['has_smpl']
+                else:
+                    self.has_smpl = np.ones(len(self.imgname))
+            except KeyError:
+                self.has_smpl = np.zeros(len(self.imgname))
+            if ignore_3d:
+                self.has_smpl = np.zeros(len(self.imgname))
+            self.has_smpl = self.has_smpl.astype(bool)
 
-        # Get gender data, if available
-        try:
-            gender = self.data['gender']
-            self.gender = np.array([0 if str(g) == 'm' else 1 for g in gender]).astype(np.int32)
-        except KeyError:
-            self.gender = -1*np.ones(len(self.imgname)).astype(np.int32)
-        
+            # Get gt 3D pose, if available
+            try:
+                self.pose_3d = self.data['S']
+                self.has_pose_3d = True
+            except KeyError:
+                self.has_pose_3d = False
+            if ignore_3d:
+                self.has_pose_3d = False
+
+            # Get 2D keypoints
+            try:
+                keypoints_gt = self.data['part']
+            except KeyError:
+                keypoints_gt = np.zeros((len(self.imgname), 24, 3))
+            try:
+                keypoints_openpose = self.data['openpose']
+            except KeyError:
+                keypoints_openpose = np.zeros((len(self.imgname), 25, 3))
+            self.keypoints = np.concatenate([keypoints_openpose, keypoints_gt], axis=1)
+
+            # Get gender data, if available
+            try:
+                gender = self.data['gender']
+                self.gender = np.array([0 if str(g) == 'm' else 1 for g in gender]).astype(np.int32)
+            except KeyError:
+                self.gender = -1*np.ones(len(self.imgname)).astype(np.int32)
+
+        else:
+            # load labels
+            npz_pth = "data/labels_train_val.npz" if "monkey" not in dataset else "data/labels_monkey_train_val.npz"
+            labels_dict = np.load(npz_pth, allow_pickle=True)
+            self.n_classes = int(labels_dict["n_classes"])
+            split_key = "train_idcs" if self.split_train else "val_idcs"
+            labels_dict = labels_dict[dataset].item()
+            idcs = labels_dict[split_key]
+            self.labels = labels_dict['labels'][idcs]
+            if dataset == "h36m":
+                nonan_idcs = np.load("data/dataset_extras/h36m_train.npz")['pose']
+                nonan_idcs = np.where(~np.isnan(nonan_idcs).any(axis=1))
+            else:
+                nonan_idcs = range(len(self.data['imgname']))
+            self.imgname = self.data['imgname'][nonan_idcs][idcs]
+            self.scale = self.data['scale'][nonan_idcs][idcs]
+            self.center = self.data['center'][nonan_idcs][idcs]
+
         self.length = self.scale.shape[0]
 
     def augm_params(self):
@@ -93,7 +118,7 @@ class BaseDataset(Dataset):
         pn = np.ones(3)  # per channel pixel-noise
         rot = 0            # rotation
         sc = 1            # scaling
-        if self.is_train:
+        if self.is_train and self.use_augmentation:
             # We flip with probability 1/2
             if np.random.uniform() <= 0.5:
                 flip = 1
@@ -183,58 +208,62 @@ class BaseDataset(Dataset):
         # Load image
         imgname = join(self.img_dir, self.imgname[index])
         try:
-            img = cv2.imread(imgname)[:,:,::-1].copy().astype(np.float32)
+            img = cv2.imread(imgname)[:,:,::-1].copy().astype(float)
         except TypeError:
             print(imgname)
         orig_shape = np.array(img.shape)[:2]
 
-        # Get SMPL parameters, if available
-        if self.has_smpl[index]:
-            pose = self.pose[index].copy()
-            betas = self.betas[index].copy()
-        else:
-            pose = np.zeros(72)
-            betas = np.zeros(10)
-
         # Process image
-        img = self.rgb_processing(img, center, sc*scale, rot, flip, pn)
-        img = torch.from_numpy(img).float()
+        img = self.rgb_processing(img,center, sc*scale, rot, flip, pn)
+        img = self.normalize_img(torch.from_numpy(img).float())
         # Store image before normalization to use it in visualization
-        item['img'] = self.normalize_img(img)
-        item['pose'] = torch.from_numpy(self.pose_processing(pose, rot, flip)).float()
-        item['betas'] = torch.from_numpy(betas).float()
-        item['imgname'] = imgname
+        item['img'] = img
 
-        # Get 3D pose, if available
-        if self.has_pose_3d:
-            S = self.pose_3d[index].copy()
-            item['pose_3d'] = torch.from_numpy(self.j3d_processing(S, rot, flip)).float()
+        if self.is_spin:
+            # Get SMPL parameters, if available
+            if self.has_smpl[index]:
+                pose = self.pose[index].copy()
+                betas = self.betas[index].copy()
+            else:
+                pose = np.zeros(72)
+                betas = np.zeros(10)
+
+            item['pose'] = torch.from_numpy(self.pose_processing(pose, rot, flip)).float()
+            item['betas'] = torch.from_numpy(betas).float()
+
+            # Get 3D pose, if available
+            if self.has_pose_3d:
+                S = self.pose_3d[index].copy()
+                item['pose_3d'] = torch.from_numpy(self.j3d_processing(S, rot, flip)).float()
+            else:
+                item['pose_3d'] = torch.zeros(24,4, dtype=torch.float32)
+
+            # Get 2D keypoints and apply augmentation transforms
+            keypoints = self.keypoints[index].copy()
+            item['keypoints'] = torch.from_numpy(self.j2d_processing(keypoints, center, sc*scale, rot, flip)).float()
+
+            item['has_smpl'] = self.has_smpl[index]
+            item['has_pose_3d'] = self.has_pose_3d
+            item['gender'] = self.gender[index]
         else:
-            item['pose_3d'] = torch.zeros(24,4, dtype=torch.float32)
+            item['label'] = torch.tensor(self.labels[index], dtype=torch.long)
 
-        # Get 2D keypoints and apply augmentation transforms
-        keypoints = self.keypoints[index].copy()
-        item['keypoints'] = torch.from_numpy(self.j2d_processing(keypoints, center, sc*scale, rot, flip)).float()
-
-        item['has_smpl'] = self.has_smpl[index]
-        item['has_pose_3d'] = self.has_pose_3d
         item['scale'] = float(sc * scale)
-        item['center'] = center.astype(np.float32)
+        item['center'] = center.astype(float)
         item['orig_shape'] = orig_shape
-        item['is_flipped'] = flip
-        item['rot_angle'] = np.float32(rot)
-        item['gender'] = self.gender[index]
+        item['is_flipped'] = bool(flip)
+        item['rot_angle'] = float(rot)
         item['sample_index'] = index
-        item['dataset_name'] = self.dataset
+        item['dataset_id'] = self.dataset_id
 
-        try:
-            item['maskname'] = self.maskname[index]
-        except AttributeError:
-            item['maskname'] = ''
-        try:
-            item['partname'] = self.partname[index]
-        except AttributeError:
-            item['partname'] = ''
+        # try:
+        #     item['maskname'] = self.maskname[index]
+        # except AttributeError:
+        #     item['maskname'] = ''
+        # try:
+        #     item['partname'] = self.partname[index]
+        # except AttributeError:
+        #     item['partname'] = ''
 
         return item
 

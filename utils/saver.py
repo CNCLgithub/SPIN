@@ -1,8 +1,23 @@
 from __future__ import division
+from collections import OrderedDict
 import os
 import datetime
 
 import torch
+
+
+class SaveOutput:
+    # stores the hooked layers
+    # Source 1: https://towardsdatascience.com/the-one-pytorch-trick-which-you-should-know-2d5e9c1da2ca
+    # Source 2: https://discuss.pytorch.org/t/extracting-stats-from-activated-layers-training/45880/2
+    def __init__(self):
+        self.outputs = OrderedDict()
+
+    def save_activation(self, name):
+        def hook(module, module_in, module_out):
+            self.outputs.update({name: module_out})
+
+        return hook
 
 class CheckpointSaver():
     """Class that handles saving and loading checkpoints during training."""
@@ -21,7 +36,8 @@ class CheckpointSaver():
         else:
             return os.path.isfile(checkpoint_file)
     
-    def save_checkpoint(self, models, optimizers, epoch, batch_idx, batch_size, dataset_perm, total_step_count):
+    def save_checkpoint(self, models, optimizers, epoch, batch_idx, batch_size,
+                        dataset_perm, total_step_count):
         """Save checkpoint."""
         timestamp = datetime.datetime.now()
         checkpoint_filename = os.path.abspath(os.path.join(self.save_dir, timestamp.strftime('%Y_%m_%d-%H_%M_%S') + '.pt'))
@@ -56,7 +72,8 @@ class CheckpointSaver():
                 'batch_idx': checkpoint['batch_idx'],
                 'batch_size': checkpoint['batch_size'],
                 'dataset_perm': checkpoint['dataset_perm'],
-                'total_step_count': checkpoint['total_step_count']}
+                'total_step_count': checkpoint['total_step_count'],
+                }
 
     def get_latest_checkpoint(self):
         """Get filename of latest checkpoint if it exists."""
